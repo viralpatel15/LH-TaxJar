@@ -5,6 +5,7 @@ import taxjar
 from frappe import _
 from frappe.contacts.doctype.address.address import get_company_address
 from frappe.utils import cint, flt
+import requests
 
 SUPPORTED_COUNTRY_CODES = [
 	"AT", "AU", "BE", "BG", "CA", "CY", "CZ", "DE", "DK", "EE",
@@ -62,8 +63,6 @@ def set_sales_tax(doc, method):
 		setattr(doc, "taxes", [tax for tax in doc.taxes if tax.account_head != TAX_ACCOUNT_HEAD])
 		return
 
-	check_for_nexus(doc, tax_dict)
-
 	tax_data = validate_tax_request(tax_dict)
 	if tax_data is None:
 		return
@@ -74,7 +73,6 @@ def set_sales_tax(doc, method):
 		for tax in doc.taxes:
 			if tax.account_head == TAX_ACCOUNT_HEAD:
 				tax.tax_amount = tax_data.amount_to_collect
-				doc.run_method("calculate_taxes_and_totals")
 				break
 		else:
 			doc.append(
@@ -204,13 +202,20 @@ def get_line_item_dict(item, docstatus):
 
 def check_for_nexus(doc, tax_dict):
 	TAX_ACCOUNT_HEAD = frappe.db.get_single_value(SETTINGS_DOCTYPE, "tax_account_head")
+	to_state = tax_dict.get("to_state")
 
-	nexus_exists = frappe.db.exists(
+	# Check the saved nexus list from TaxJar
+	nexus_in_list = frappe.db.exists(
 		"Lyfe TaxJar Nexus",
-		{"parent": SETTINGS_DOCTYPE, "region_code": tax_dict.get("to_state")},
+		{"parent": SETTINGS_DOCTYPE, "region_code": to_state},
 	)
 
-	if not nexus_exists:
+	# Also treat the company_address state as implicit nexus — you always have
+	# nexus in the state where your company is physically located.
+	from_state = tax_dict.get("from_state")
+	implicit_nexus = to_state and from_state and (to_state == from_state)
+
+	if not nexus_in_list and not implicit_nexus:
 		for item in doc.get("items"):
 			item.tax_collectable = flt(0)
 			item.taxable_amount = flt(0)
@@ -244,17 +249,80 @@ def check_sales_tax_exemption(doc):
 
 
 def validate_tax_request(tax_dict):
-	client = get_client()
-	if not client:
+	"""
+	POST /v2/taxes directly via requests to avoid the TaxJar Python client's
+	KeyError bug where error responses without a 'status' key crash the library.
+	Returns a frappe._dict with .amount_to_collect and .breakdown.line_items,
+	or None when no client credentials are configured.
+	"""
+	settings = frappe.get_single(SETTINGS_DOCTYPE)
+
+	# Tax calculation is a read-only rate lookup — always use the live API.
+	# The TaxJar sandbox does not reliably support /v2/taxes (returns 500).
+	# Sandbox mode only controls whether transactions are recorded (create/delete order).
+	api_key = settings.api_key and settings.get_password("api_key")
+	if not api_key:
 		return None
+
+	url = f"{taxjar.DEFAULT_API_URL.rstrip('/')}/{taxjar.API_VERSION}/taxes"
+
 	try:
-		return client.tax_for_order(tax_dict)
-	except taxjar.exceptions.TaxJarResponseError as err:
-		frappe.throw(_(sanitize_error_response(err)))
+		response = requests.post(
+			url,
+			json=tax_dict,
+			headers={"Authorization": f"Bearer {api_key}"},
+			timeout=15,
+		)
+	except requests.ConnectionError:
+		frappe.throw(_("Could not reach TaxJar. Please check your internet connection."))
+	except requests.Timeout:
+		frappe.throw(_("TaxJar request timed out. Please try again."))
+
+	if response.status_code == 200:
+		return _to_tax_result(response.json().get("tax", {}))
+
+	try:
+		body = response.json()
+	except Exception:
+		body = {"raw": response.text[:500]}
+
+	frappe.log_error(
+		title="TaxJar tax_for_order failed",
+		message=f"URL: {url}\nHTTP {response.status_code}\nResponse: {body}",
+	)
+
+	detail = body.get("detail") or body.get("message") or body.get("error") or str(body)
+	frappe.throw(
+		_("TaxJar API error (HTTP {0}): {1}. Check Error Log for details.").format(
+			response.status_code, detail
+		)
+	)
+
+
+def _to_tax_result(tax):
+	"""
+	Convert the raw /v2/taxes response dict into a frappe._dict whose attribute
+	paths match what set_sales_tax expects:
+	  result.amount_to_collect
+	  result.breakdown.line_items[n].id / .tax_collectable / .taxable_amount
+	"""
+	result = frappe._dict(tax)
+	if result.get("breakdown"):
+		bd = frappe._dict(result.breakdown)
+		bd.line_items = [frappe._dict(li) for li in (bd.get("line_items") or [])]
+		result.breakdown = bd
+	return result
 
 
 def get_company_address_details(doc):
 	from erpnext import get_default_company
+
+	# Prefer the company_address set directly on the document (Sales Invoice /
+	# Sales Order / Quotation all carry this field).  Fall back to the company's
+	# default address when the field is blank.
+	doc_company_address = getattr(doc, "company_address", None)
+	if doc_company_address:
+		return frappe.get_doc("Address", doc_company_address)
 
 	company = getattr(doc, "company", None) or get_default_company()
 	company_address = get_company_address(company).company_address
@@ -327,10 +395,21 @@ def sanitize_error_response(response):
 
 
 def _is_us_company(doc):
-	"""Return True when the document's company is based in the United States."""
+	"""Return True when the document's company is based in the United States.
+
+	Handles two common storage formats for the country field:
+	  - Full name link value: "United States"
+	  - ISO code stored directly: "US" or "us"
+	"""
 	company = getattr(doc, "company", None)
 	if not company:
 		from erpnext import get_default_company
 		company = get_default_company()
 	country = frappe.db.get_value("Company", company, "country")
-	return country == "United States"
+	if not country:
+		return False
+	if country == "United States":
+		return True
+	# If stored as a country code ("US" / "us"), look up the Country record by code
+	country_code = frappe.db.get_value("Country", {"code": country.lower()}, "code")
+	return bool(country_code)

@@ -1,12 +1,15 @@
 """
 Patch: create_tax_account_head
-Creates two accounts in the Chart of Accounts for every company:
+Creates two accounts in the Chart of Accounts for every USD company:
 
   1. Sales Tax Payable       → Duties and Taxes (Liability)
   2. Shipping Income         → Direct Income    (Income)
 
 Both are then set as the Tax Account Head and Shipping Account Head in
 Lyfe TaxJar Settings, but only when those fields are currently blank.
+
+Also sets "Lyfe Hardware" as the session default company for every
+existing user (and globally), so it pre-fills on all new documents.
 """
 
 import frappe
@@ -27,8 +30,15 @@ SHIPPING_PARENT_CANDIDATES = [
 ]
 
 
+DEFAULT_COMPANY = "Lyfe Hardware."
+
+
 def execute():
-	companies = frappe.get_all("Company", fields=["name", "abbr", "default_currency"])
+	companies = frappe.get_all(
+		"Company",
+		filters={"default_currency": "USD"},
+		fields=["name", "abbr", "default_currency"],
+	)
 
 	for company in companies:
 		tax_account = _ensure_account(
@@ -48,6 +58,8 @@ def execute():
 		)
 
 		_maybe_update_settings(tax_account, shipping_account)
+
+	_set_default_company_for_all_users()
 
 
 def _ensure_account(company, account_name, account_type, root_type, parent_candidates):
@@ -126,3 +138,22 @@ def _maybe_update_settings(tax_account, shipping_account):
 
 	if updates:
 		frappe.db.commit()
+
+
+def _set_default_company_for_all_users():
+	"""
+	Set DEFAULT_COMPANY as the session default company for every user so it
+	pre-fills on all new documents. Skipped if the company does not exist.
+	"""
+	if not frappe.db.exists("Company", DEFAULT_COMPANY):
+		return
+
+	# Global default — applies to any user who has no user-level override
+	frappe.db.set_default("company", DEFAULT_COMPANY)
+
+	# Per-user defaults — ensures every existing enabled user also gets the pre-fill
+	users = frappe.get_all("User", filters={"enabled": 1}, pluck="name")
+	for user in users:
+		frappe.defaults.set_user_default("company", DEFAULT_COMPANY, user=user)
+
+	frappe.db.commit()
