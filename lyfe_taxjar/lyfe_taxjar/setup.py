@@ -10,6 +10,8 @@ def after_install():
 	seed_product_tax_categories()
 	make_custom_fields()
 	add_permissions()
+	from lyfe_taxjar.lyfe_taxjar.patches.create_tax_account_head import execute as create_tax_account_head
+	create_tax_account_head()
 
 
 def seed_product_tax_categories():
