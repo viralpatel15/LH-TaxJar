@@ -5,6 +5,8 @@ app_description = "TaxJar integration for Lyfe Hardware"
 app_email = "hello@lyfehardware.com"
 app_license = "mit"
 
+after_install = "lyfe_taxjar.lyfe_taxjar.setup.after_install"
+
 # Apps
 # ------------------
 
@@ -137,13 +139,15 @@ app_license = "mit"
 # ---------------
 # Hook on document methods and events
 
-# doc_events = {
-# 	"*": {
-# 		"on_update": "method",
-# 		"on_cancel": "method",
-# 		"on_trash": "method"
-# 	}
-# }
+doc_events = {
+	"Sales Invoice": {
+		"on_submit": "lyfe_taxjar.lyfe_taxjar.utils.create_transaction",
+		"on_cancel": "lyfe_taxjar.lyfe_taxjar.utils.delete_transaction",
+	},
+	("Quotation", "Sales Order", "Sales Invoice"): {
+		"validate": "lyfe_taxjar.lyfe_taxjar.utils.set_sales_tax",
+	},
+}
 
 # Scheduled Tasks
 # ---------------
