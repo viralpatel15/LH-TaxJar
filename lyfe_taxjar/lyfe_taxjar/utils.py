@@ -24,6 +24,32 @@ SUPPORTED_STATE_CODES = [
 SETTINGS_DOCTYPE = "Lyfe TaxJar Settings"
 
 
+def _log_request(url, request_data, response_body, *, doc=None, description=None, is_error=False):
+	"""Write an outbound API call to Integration Request for audit / debugging."""
+	try:
+		log = {
+			"doctype": "Integration Request",
+			"integration_request_service": "TaxJar",
+			"is_remote_request": 1,
+			"url": url,
+			"data": frappe.as_json(request_data, indent=1) if request_data is not None else None,
+			"status": "Failed" if is_error else "Completed",
+			"request_description": description or "TaxJar API Request",
+		}
+		if doc:
+			log["reference_doctype"] = doc.doctype
+			log["reference_docname"] = doc.name
+		if is_error:
+			log["error"] = frappe.as_json(response_body, indent=1) if response_body is not None else None
+		else:
+			log["output"] = frappe.as_json(response_body, indent=1) if response_body is not None else None
+
+		frappe.get_doc(log).insert(ignore_permissions=True)
+		frappe.db.commit()
+	except Exception:
+		frappe.log_error(frappe.get_traceback(), "TaxJar: failed to write Integration Request log")
+
+
 def get_client():
 	settings = frappe.get_single(SETTINGS_DOCTYPE)
 
@@ -63,7 +89,7 @@ def set_sales_tax(doc, method):
 		setattr(doc, "taxes", [tax for tax in doc.taxes if tax.account_head != TAX_ACCOUNT_HEAD])
 		return
 
-	tax_data = validate_tax_request(tax_dict)
+	tax_data = validate_tax_request(tax_dict, doc=doc)
 	if tax_data is None:
 		return
 
@@ -119,14 +145,45 @@ def create_transaction(doc, method):
 	tax_dict["sales_tax"] = sales_tax
 	tax_dict["amount"] = doc.total + tax_dict["shipping"]
 
+	api_url = taxjar.DEFAULT_API_URL.rstrip("/")
+	if tax_dict.get("is_sandbox"):
+		api_url = taxjar.SANDBOX_API_URL.rstrip("/")
+
+	endpoint = "refunds" if doc.is_return else "orders"
+	url = f"{api_url}/{taxjar.API_VERSION}/transactions/{endpoint}"
+
 	try:
 		if doc.is_return:
-			client.create_refund(tax_dict)
+			result = client.create_refund(tax_dict)
 		else:
-			client.create_order(tax_dict)
+			result = client.create_order(tax_dict)
+
+		_log_request(
+			url,
+			tax_dict,
+			result.__dict__ if hasattr(result, "__dict__") else result,
+			doc=doc,
+			description=f"Create {'Refund' if doc.is_return else 'Order'} Transaction",
+		)
 	except taxjar.exceptions.TaxJarResponseError as err:
+		_log_request(
+			url,
+			tax_dict,
+			{"error": str(err), "full_response": getattr(err, "full_response", {})},
+			doc=doc,
+			description=f"Create {'Refund' if doc.is_return else 'Order'} Transaction",
+			is_error=True,
+		)
 		frappe.throw(_(sanitize_error_response(err)))
 	except Exception:
+		_log_request(
+			url,
+			tax_dict,
+			{"traceback": traceback.format_exc()},
+			doc=doc,
+			description=f"Create {'Refund' if doc.is_return else 'Order'} Transaction",
+			is_error=True,
+		)
 		frappe.log_error(frappe.get_traceback(), "Lyfe TaxJar: create_transaction failed")
 
 
@@ -139,9 +196,27 @@ def delete_transaction(doc, method):
 	if not client:
 		return
 
+	api_url = taxjar.DEFAULT_API_URL.rstrip("/")
+	url = f"{api_url}/{taxjar.API_VERSION}/transactions/orders/{doc.name}"
+
 	try:
-		client.delete_order(doc.name)
+		result = client.delete_order(doc.name)
+		_log_request(
+			url,
+			{"transaction_id": doc.name},
+			result.__dict__ if hasattr(result, "__dict__") else result,
+			doc=doc,
+			description="Delete Order Transaction",
+		)
 	except taxjar.exceptions.TaxJarResponseError as err:
+		_log_request(
+			url,
+			{"transaction_id": doc.name},
+			{"error": str(err), "full_response": getattr(err, "full_response", {})},
+			doc=doc,
+			description="Delete Order Transaction",
+			is_error=True,
+		)
 		frappe.log_error(str(err), "Lyfe TaxJar: delete_transaction failed")
 
 
@@ -248,7 +323,7 @@ def check_sales_tax_exemption(doc):
 	return False
 
 
-def validate_tax_request(tax_dict):
+def validate_tax_request(tax_dict, doc=None):
 	"""
 	POST /v2/taxes directly via requests to avoid the TaxJar Python client's
 	KeyError bug where error responses without a 'status' key crash the library.
@@ -259,7 +334,6 @@ def validate_tax_request(tax_dict):
 
 	# Tax calculation is a read-only rate lookup — always use the live API.
 	# The TaxJar sandbox does not reliably support /v2/taxes (returns 500).
-	# Sandbox mode only controls whether transactions are recorded (create/delete order).
 	api_key = settings.api_key and settings.get_password("api_key")
 	if not api_key:
 		return None
@@ -274,18 +348,23 @@ def validate_tax_request(tax_dict):
 			timeout=15,
 		)
 	except requests.ConnectionError:
+		_log_request(url, tax_dict, {"error": "ConnectionError"}, doc=doc, description="Tax Calculation", is_error=True)
 		frappe.throw(_("Could not reach TaxJar. Please check your internet connection."))
 	except requests.Timeout:
+		_log_request(url, tax_dict, {"error": "Timeout"}, doc=doc, description="Tax Calculation", is_error=True)
 		frappe.throw(_("TaxJar request timed out. Please try again."))
 
 	if response.status_code == 200:
-		return _to_tax_result(response.json().get("tax", {}))
+		body = response.json()
+		_log_request(url, tax_dict, body, doc=doc, description="Tax Calculation")
+		return _to_tax_result(body.get("tax", {}))
 
 	try:
 		body = response.json()
 	except Exception:
 		body = {"raw": response.text[:500]}
 
+	_log_request(url, tax_dict, body, doc=doc, description="Tax Calculation", is_error=True)
 	frappe.log_error(
 		title="TaxJar tax_for_order failed",
 		message=f"URL: {url}\nHTTP {response.status_code}\nResponse: {body}",
